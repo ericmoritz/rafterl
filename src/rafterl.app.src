@@ -1,0 +1,12 @@
+{application, rafterl,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { rafterl_app, []}},
+  {env, []}
+ ]}.
