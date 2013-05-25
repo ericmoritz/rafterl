@@ -1,3 +1,5 @@
-# rafterl
+=======
+rafterl
+=======
 
-This provides the algorithms guide leaders, candidates and followers
+An experimental implementation of the Raft consensus algorithm
