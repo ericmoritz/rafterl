@@ -1,8 +1,6 @@
+PROJECT=rafterl
 
-all: get-deps build
+include erlang.mk
 
-get-deps:
-	rebar get-deps
-
-build:
-	rebar compile
+clean: 
+	rm -rf deps ebin
