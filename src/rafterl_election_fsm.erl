@@ -11,6 +11,10 @@
 
 -behaviour(gen_fsm).
 
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
 %% API
 -export([start_link/5, vote/4, cancel/1]).
 
@@ -19,6 +23,8 @@
          handle_sync_event/4, handle_info/3, terminate/3, code_change/4]).
 
 -define(SERVER, ?MODULE).
+
+-record(vote, {voter_id, term, vote_granted}).
 
 -record(state, {
           nodes,
@@ -44,12 +50,12 @@
 %% @end
 %%--------------------------------------------------------------------
 start_link(Nodes, ElectionTerm, CandidateId, LastLogIndex, LastLogTerm) ->
-    gen_fsm:start_link({local, ?SERVER}, ?MODULE, [], [Nodes, ElectionTerm, CandidateId, LastLogIndex, LastLogTerm]).
+    gen_fsm:start_link(?MODULE, [Nodes, ElectionTerm, CandidateId, LastLogIndex, LastLogTerm], []).
 
-vote(ElectionPid, VoterId, Term, VoteGrated) ->
+vote(ElectionPid, VoterId, Term, VoteGranted) ->
     gen_fsm:send_event(
       ElectionPid,
-      {vote, VoterId, Term, VoteGrated}
+      #vote{voter_id=VoterId, term=Term, vote_granted=VoteGranted}
      ).
 
 %%%===================================================================
@@ -106,20 +112,88 @@ cancel(ElectionPid) ->
 %%                   {stop, Reason, NewState}
 %% @end
 %%--------------------------------------------------------------------
-collecting_votes({vote, _VoterID, Term, _VoteGranted}, State=#state{election_term=ElectionTerm}) when Term > ElectionTerm ->
+-spec collecting_votes(#vote{}, #state{}) -> {stop, step_down | won, #state{}} | {next_state, collecting_votes, #state{}}.
+collecting_votes(#vote{term=Term}, State=#state{election_term=ElectionTerm}) when Term > ElectionTerm ->
     % Voter has a higher term, stepping down
     {stop, step_down, State};
-collecting_votes({vote, VoterID, _Term, true}, State=#state{majority=Majority, votes=Votes}) ->
+collecting_votes(#vote{vote_granted=true, voter_id=VoterID}, State=#state{majority=Majority, votes=Votes}) ->
     % record vote
     Votes2 = sets:add_element(VoterID, Votes),
     VoteCount = sets:size(Votes2),
+    State2 = State#state{votes=Votes2},
+
     case VoteCount >= Majority of
         true ->
-            {stop, won, State};
+            {stop, won, State2};
         false ->
-            State2 = State#state{votes=Votes2},
             {next_state, collecting_votes, State2}
     end.
+
+-ifdef(TEST).
+
+collecting_votes_higher_term_test() ->
+    Vote = #vote{
+      term=3
+     },
+    State = #state{
+      election_term=2
+     },
+    ?assertEqual(
+       {stop, step_down, State},
+       collecting_votes(Vote, State)
+      ).
+
+collecting_votes_won_test() ->
+    Vote = #vote{
+      term=1,
+      voter_id=eric,
+      vote_granted=true
+     },
+
+    State = #state{
+      election_term=2,
+      majority=3,
+      votes=sets:from_list([glenn, mark])
+     },
+
+    State2 = State#state{
+	       votes=sets:add_element(
+		       eric,
+		       State#state.votes
+		      )
+	      },
+
+    ?assertEqual(
+       {stop, won, State2},
+       collecting_votes(Vote, State)
+      ).
+
+collecting_votes_undetermined_test() ->
+    Vote = #vote{
+      term=1,
+      voter_id=eric,
+      vote_granted=true
+     },
+
+    State = #state{
+      election_term=2,
+      majority=3,
+      votes=sets:from_list([glenn])
+     },
+
+    State2 = State#state{
+	       votes=sets:add_element(
+		       eric,
+		       State#state.votes
+		      )
+	      },
+
+    ?assertEqual(
+       {next_state, collecting_votes, State2},
+       collecting_votes(Vote, State)
+      ).
+
+-endif.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -139,6 +213,7 @@ collecting_votes({vote, VoterID, _Term, true}, State=#state{majority=Majority, v
 %%                   {stop, Reason, Reply, NewState}
 %% @end
 %%--------------------------------------------------------------------
+-spec collecting_votes(cancel, any(), #state{}) -> {stop, canceled, stopped, #state{}}.
 collecting_votes(cancel, _From, State) ->
     {stop, canceled, stopped, State}.
 
@@ -223,5 +298,24 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+-spec majority(list()) -> integer().
 majority(Nodes) ->
-    size(Nodes) div 2 + 1.
+    length(Nodes) div 2 + 1.
+
+-ifdef(TEST).
+majority_test() ->
+    ?assertEqual(
+       2,
+       majority(lists:seq(1, 3))
+      ),
+
+    ?assertEqual(
+       3,
+       majority(lists:seq(1, 4))
+      ),
+
+    ?assertEqual(
+       3,
+       majority(lists:seq(1, 5))
+      ).
+-endif.
