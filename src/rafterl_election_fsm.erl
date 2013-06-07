@@ -16,7 +16,7 @@
 -endif.
 
 %% API
--export([start_link/5, vote/4, cancel/1]).
+-export([start_link/2, vote/4, cancel/1]).
 
 %% gen_fsm callbacks
 -export([init/1, collecting_votes/2, collecting_votes/3, handle_event/3,
@@ -27,14 +27,12 @@
 -record(vote, {voter_id, term, vote_granted}).
 
 -record(state, {
-          nodes,
+          voter_count,
           election_term,
-          candidate_id,
-          last_log_index,
-          last_log_term,
           majority,
           votes=sets:new()
          }).
+
 
 %%%===================================================================
 %%% API
@@ -49,8 +47,8 @@
 %% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
-start_link(Nodes, ElectionTerm, CandidateId, LastLogIndex, LastLogTerm) ->
-    gen_fsm:start_link(?MODULE, [Nodes, ElectionTerm, CandidateId, LastLogIndex, LastLogTerm], []).
+start_link(VoterCount, ElectionTerm) ->
+    gen_fsm:start_link(?MODULE, [VoterCount, ElectionTerm], []).
 
 vote(ElectionPid, VoterId, Term, VoteGranted) ->
     gen_fsm:send_event(
@@ -75,18 +73,15 @@ vote(ElectionPid, VoterId, Term, VoteGranted) ->
 %%                     {stop, StopReason}
 %% @end
 %%--------------------------------------------------------------------
-init([Nodes, ElectionTerm, CandidateId, LastLogIndex, LastLogTerm]) ->
-    Majority = majority(Nodes),
+init([VoterCount, ElectionTerm]) ->
+    Majority = majority(VoterCount),
     {ok, 
      collecting_votes,
      #state{
-        nodes=Nodes,
-        election_term=ElectionTerm,
-        candidate_id=CandidateId,
-        last_log_index=LastLogIndex,
-        last_log_term=LastLogTerm,
-        majority=Majority
-       }
+       voter_count=VoterCount,
+       majority=Majority,
+       election_term=ElectionTerm
+      }
     }.
 
 %%--------------------------------------------------------------------
@@ -95,7 +90,7 @@ init([Nodes, ElectionTerm, CandidateId, LastLogIndex, LastLogTerm]) ->
 %% @end
 %%--------------------------------------------------------------------
 cancel(ElectionPid) ->
-    gen_fsm:send_sync_event(ElectionPid, cancel).
+    gen_fsm:sync_send_event(ElectionPid, cancel).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -298,24 +293,24 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
--spec majority(list()) -> integer().
-majority(Nodes) ->
-    length(Nodes) div 2 + 1.
+-spec majority(integer()) -> integer().
+majority(Voters) ->
+    Voters div 2 + 1.
 
 -ifdef(TEST).
 majority_test() ->
     ?assertEqual(
        2,
-       majority(lists:seq(1, 3))
+       majority(3)
       ),
 
     ?assertEqual(
        3,
-       majority(lists:seq(1, 4))
+       majority(4)
       ),
 
     ?assertEqual(
        3,
-       majority(lists:seq(1, 5))
+       majority(5)
       ).
 -endif.

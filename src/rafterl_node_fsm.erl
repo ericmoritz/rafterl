@@ -11,28 +11,24 @@
 -behaviour(gen_fsm).
 
 %% API
--export([start_link/0, set_cluster/2, 
-	 request_vote/5, vote/4, append_entries/7, append_entries_reply/4]).
+-export([start_link/0, set_cluster/2]).
 
 %% gen_fsm callbacks
--export([init/1, candidate/2, handle_event/3,
+-export([init/1, handle_event/3,
 	 handle_sync_event/4, handle_info/3, terminate/3, code_change/4]).
 
 -define(SERVER, ?MODULE).
 
 -record(state, {
-	  current_term=0,
-	  voted_for=undefined,
 	  log,
 	  nodes,
 	  timeout_ref,
-	  current_election
+	  election_pid
 	 }).
 
--record(election, {
-	  majority,
-	  votes_for=ordsets:new()
-	 }).
+-record(vote_request, 
+	{election_pid, term, candidate_pid, last_log_index, last_log_term}
+       ).
 
 %%%===================================================================
 %%% API
@@ -66,63 +62,23 @@ set_cluster(NodePid, ClusterPids) ->
 %% Requests a vote from a node
 %% @end
 %%--------------------------------------------------------------------
--spec request_vote(NodePid :: pid(), Term :: any(), 
+-spec request_vote(NodePid :: pid(), ElectionPid :: pid(),
+		   Term :: integer(),
 		   CandidatePid :: pid(), 
 		   LastLogIndex :: integer(), LastLogTerm :: any())
 		  -> ok.
-request_vote(NodePid, Term, CandidatePid, LastLogIndex, LastLogTerm) -> 
-    gen_fsm:send_event(
+request_vote(NodePid, ElectionPid, Term, CandidatePid, LastLogIndex, LastLogTerm) -> 
+    gen_fsm:send_all_state_event(
       NodePid,
-      {request_vote, Term, CandidatePid, LastLogIndex, LastLogTerm}
-     ).
-      
-%%--------------------------------------------------------------------
-%% @doc
-%% Vote for a candidate
-%% @end
-%%--------------------------------------------------------------------
--spec vote(CandidatePid :: pid(), NodePid :: pid(), 
-	   Term :: any(), VoteGranted :: boolean()) ->
-		  ok.
-vote(CandidatePid, NodePid, Term, VoteGranted) ->
-    gen_fsm:send_event(
-      CandidatePid,
-      {vote, NodePid, Term, VoteGranted}
+      #vote_request{
+	election_pid=ElectionPid,
+	term=Term, 
+	candidate_pid=CandidatePid, 
+	last_log_index=LastLogIndex, 
+	last_log_term=LastLogTerm
+       }
      ).
 
-%%--------------------------------------------------------------------
-%% @doc
-%% Append a log entry, called by the leader
-%% @end
-%%--------------------------------------------------------------------
--spec append_entries(
-	NodePid :: pid(), 
-	Term :: any(), 
-	LeaderPid :: pid(),
-	PrevLogIndex :: integer(),
-	PrevLogTerm :: integer(),
-	Entries :: [any()],
-	CommitIndex :: integer()) -> ok.
-append_entries(NodePid, Term, LeaderPid, PrevLogIndex, PrevLogTerm, Entries, CommitIndex) ->
-    gen_fsm:send_event(
-      NodePid,
-      {append_entry,
-       {Term, LeaderPid, PrevLogIndex, PrevLogTerm, Entries, CommitIndex}
-      }
-     ).
-
-%%--------------------------------------------------------------------
-%% @doc
-%% Reply to the append log entry request
-%% @end
-%%--------------------------------------------------------------------
-append_entries_reply(LeaderPid, FollowerPid, Term, Success) ->
-    gen_fsm:send_event(
-      LeaderPid,
-      {append_entry_reply,
-       {FollowerPid, Term, Success}
-      }
-     ).
 
 %%%===================================================================
 %%% gen_fsm callbacks
@@ -159,23 +115,7 @@ init([]) ->
 %%                   {stop, Reason, NewState}
 %% @end
 %%--------------------------------------------------------------------
-candidate({vote, NodePid, Term, VoteGranted}, State=#state{current_term=CurrentTerm}) ->
-    % record vote
-    State1 = record_vote(NodePid, VoteGranted, State),
-    % whats the election status?
-    case election_status(Term, CurrentTerm, State1#state.current_election) of
-	winner ->
-	    % become the leader of these slobs
-	    State2 = reset_timeout(State1),
-	    {next_state, leader, State2};
-	step_down ->
-	    % crap, someone is already a leader, heed to their authority
-	    State2 = step_down(State1),
-	    {next_state, follower, State2};
-	undetermined ->
-	    % continue being candidate
-	    {next_state, candidate, State1}
-    end.
+    
 
 %%--------------------------------------------------------------------
 %% @private
@@ -212,8 +152,41 @@ state_name(_Event, _From, State) ->
 %%                   {stop, Reason, NewState}
 %% @end
 %%--------------------------------------------------------------------
-handle_event(_Event, StateName, State) ->
-    {next_state, StateName, State}.
+handle_event(Vote=#vote_request{}, StateName, State=#state{log=Log}) ->
+    % extract the needed info from the log
+    {ok, CurrentTerm} = rafterl_log:current_term(Log),
+    {ok, VotedFor} = rafterl_log:voted_for(Log),
+    {ok, LastIndex} = rafterl_log:last_index(Log),
+    {ok, LastTerm} = rafterl_log:last_term(Log),
+    
+    UpdateTerm = Vote#vote_request.term > CurrentTerm,
+    StepDown = StateName =/= follower andalso UpdateTerm,
+    GrantVote = grant_vote(Vote, CurrentTerm, VotedFor, LastIndex, LastTerm),
+
+    % Update the term if we need to
+    CurrentTerm2 = if UpdateTerm ->
+			   rafterl_log:last_term(Log, Vote#vote_request.term),
+			   Vote#vote_request.term;
+		      true ->
+			   CurrentTerm
+		   end,
+    {StateName2, State2} = if StepDown ->
+				 {follower, step_down(State)};
+			    true ->
+				 {StateName, State}
+			 end,
+    % send the vote
+    rafterl_log:vote(
+      Vote#vote_request.election_pid,
+      self(),
+      CurrentTerm2,
+      GrantVote
+     ),
+    {next_state, StateName2, State2}.
+       
+    
+    
+    
 
 %%--------------------------------------------------------------------
 %% @private
@@ -286,6 +259,32 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+-spec grant_vote(#vote_request{}, 
+		 CurrentTerm :: integer(), 
+		 VotedFor :: any(),
+		 LastIndex :: integer(), 
+		 LastEntry :: any()) 
+		->
+			{VoteTermStale :: boolean(),
+			 UpdateCurrentTerm :: boolean(),
+			 GrantVote :: boolean()}.
+
+grant_vote(Vote, CurrentTerm, VotedFor, LastIndex, LastEntry) ->
+    Vote#vote_request.term >= CurrentTerm andalso
+	can_vote_for(VotedFor, Vote#vote_request.candidate_pid) andalso
+	candidate_log_is_as_complete(Vote, LastIndex, LastEntry).
+
+can_vote_for(undefined, CandidatePid) ->
+    true;
+can_vote_for(CandidatePid, CandidatePid) ->
+    true;
+can_vote_for(_, _) ->
+    false.
+
+candidate_log_is_as_complete(Vote, LastIndex, LastEntry) ->
+    % TODO
+    false.
+	
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -315,98 +314,38 @@ reset_timeout(State=#state{timeout_ref=Ref}) ->
 
 %%--------------------------------------------------------------------
 %% @doc
-%% step down, resets the timeout and clear election
+%% Step Down from being a leader or a candidate
 %% @end
 %%--------------------------------------------------------------------
 step_down(State) ->
-    State1 = reset_timeout(State),
-    State1#state{current_election=undefined}.
+    reset_timeout(
+      cancel_election(
+	State
+       )
+     ).
 
 %%--------------------------------------------------------------------
 %% @doc
-%% Starts the election and broadcasts requestvote events to all
-%% the nodes
+%% Cancel any existing elections
 %% @end
 %%--------------------------------------------------------------------
--spec broadcast_election(pid(), #state{}) -> #state{}.
-broadcast_election(CandidatePid, State=#state{log=Log, nodes=Nodes}) ->
-    LastLogIndex = rafterl_log:last_index(Log),
-    State1 = new_election(CandidatePid, State),
-    State2 = reset_timeout(State1),
-    CurrentTerm = State2#state.current_term,
-    {LastLogTerm, _} = rafterl_log:entry(Log, LastLogIndex),
-    do_vote_broadcast(
-      Nodes, 
-      CurrentTerm, 
-      CandidatePid,
-      LastLogIndex, 
-      LastLogTerm
-     ),
-    State2.
+cancel_election(State=#state{election_pid=undefined}) ->
+    State;
+cancel_election(State=#state{election_pid=Pid}) ->
+    rafterl_node_fsm:cancel(Pid),
+    State#state{election_pid=undefined}.
 
-%%--------------------------------------------------------------------
-%% @doc
-%% Creates a new election state
-%% @end
-%%--------------------------------------------------------------------
-new_election(CandidateId, State=#state{nodes=Nodes, current_term=PreviousTerm}) ->
-    Majority = size(Nodes) div 2 + 1,
-    State#state{
-      current_term=PreviousTerm+1,
-      voted_for=CandidateId,
-      current_election=#election{
-	majority=Majority
-       }
-     }.
 
-%%--------------------------------------------------------------------
-%% @doc
-%% record the vote in the state
-%% @end
-%%--------------------------------------------------------------------
-record_vote(NodePid, true, State=#state{current_election=Election}) ->
-    VotesFor = Election#election.votes_for,
-    VotesFor2 = ordsets:add_element(NodePid, VotesFor),
-    Election2 = Election#election{votes_for=VotesFor2},
-    State#state{current_election=Election2};
-record_vote(_, false, State) ->
-    % ignore non-granted votes
-    State.
+broadcast_election(CandidatePid, State) ->
+    VoterCount = length(State#state.nodes),
+    Term = rafterl_log:term(State#state.log),
+    LastLogIndex = rafterl_log:last_index(State#state.log),
 
-	
-
-%%--------------------------------------------------------------------
-%% @doc
-%% What is the status of the election?
-%% @end
-%%--------------------------------------------------------------------
-election_status(CurrentTerm, Term, _) when Term > CurrentTerm ->
-    step_down;
-election_status(_, _, #election{majority=Majority, votes_for=Votes}) ->
-    VoteForCount = ordsets:size(Votes),
-    case VoteForCount >= Majority of
-	true ->
-	    winner;
-	false ->
-	    undetermined
-    end.
-%%--------------------------------------------------------------------
-%% @doc
-%% Actually do the request of the votes
-%% @end
-%%--------------------------------------------------------------------
-do_vote_broadcast(Nodes, CurrentTerm, CandidatePid, LastLogIndex, LastLogTerm) ->
-    % TODO: Create a FSM for each pending vote that repeatably sends
-    % request vote messages 
-    % 
-    % 5.2 "If the candidate receives no response for an RPC, it
-    % reissues the RPC repeatedly until a response arrives or the
-    % election concludes
-    _ = [request_vote(
-       NodePid,
-       CurrentTerm,
-       CandidatePid,
-       LastLogIndex,
-       LastLogTerm
-      ) || NodePid <- Nodes],
-    ok.
+    {ok, Pid} = rafterl_election_fsm:start_link(
+		  VoterCount,
+		  Term
+		 ),
+    _ = [request_vote(NodePid, Pid, Term, self(), LastLogIndex, Term) ||
+	    NodePid <- State#state.nodes],
+    
+    State#state{election_pid=Pid}.
